@@ -1,0 +1,15 @@
+[package]
+name = "rust-comparer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+model2vec-rs = "0.1.4"
+fastembed = "5.13.4"
+cpu-time = "1.0.0"
+anyhow = "1"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

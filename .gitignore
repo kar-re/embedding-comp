@@ -1,0 +1,6 @@
+/target
+goldfish.db
+goldfish.db-shm
+goldfish.db-wal
+goldfish.hnsw
+.fastembed_cache/
