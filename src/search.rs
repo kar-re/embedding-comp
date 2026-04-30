@@ -1,17 +1,14 @@
-//! Side-by-side retrieval demo so you can eyeball quality, not just speed.
+//! Side-by-side retrieval demo.
 //!
-//! Builds a small themed corpus, runs the same queries through both models,
-//! and prints top-k by cosine similarity. The docs are deliberately diverse
-//! (chat, code, browser, kb) and the queries are paraphrases — not exact
-//! keyword matches — so you can see whether the embedding actually captures
-//! meaning vs surface form.
+//! Compares all four model2vec "potion" variants and fastembed/BGE-small on
+//! the same corpus and queries. The corpus includes a Swedish entry and the
+//! queries include a Swedish paraphrase, since real goldfish snapshots are
+//! mixed-language.
 
 use anyhow::Result;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use model2vec_rs::model::StaticModel;
 
-/// A miniature "what would I actually search for in goldfish" corpus.
-/// Each entry imitates a snapshot you might capture during a workday.
 pub fn search_corpus() -> Vec<&'static str> {
     vec![
         // 0: payments incident
@@ -41,7 +38,7 @@ pub fn search_corpus() -> Vec<&'static str> {
         // 8: linear ticket
         "Linear GOLD-128 — Bug: snapshot indexer occasionally hangs on safari \
          windows with very long accessibility trees, repro on macOS 15.4",
-        // 9: jira ticket (similar app, different ecosystem)
+        // 9: jira ticket
         "Jira PROJ-1923 — Feature: add semantic search to chronicle viewer, \
          priority high, assigned to backend team",
         // 10: spotify
@@ -58,16 +55,26 @@ pub fn search_corpus() -> Vec<&'static str> {
         // 14: nyt
         "Safari — nytimes.com — Federal Reserve holds rates steady amid mixed \
          economic signals, markets close mostly flat",
+        // 15: Swedish standup notes (mirrors what shows up in real goldfish data)
+        "Notion — Standup — Idag: jobbade vidare på workflow-detektering, \
+         förbättrade CPU-användningen i indexer:n, började titta på flerspråkig sökning",
     ]
 }
 
 pub fn queries() -> Vec<&'static str> {
     vec![
+        // Abstract paraphrase — the one base-8M missed
         "what was that production outage about",
+        // Concrete keyword
         "rust code for embedding documents",
+        // Topical paraphrase
         "how much are we spending on cloud",
+        // Concrete keyword
         "the bug where the indexer freezes",
+        // Topical
         "switching from candle to a faster embedder",
+        // Swedish — only multilingual model should land this
+        "förbättrad prestanda i sökindexet",
     ]
 }
 
@@ -105,40 +112,121 @@ fn snippet(s: &str, n: usize) -> String {
     }
 }
 
+/// Per-(model, query) top-1 result, used to print a compact comparison table.
+struct Top1 {
+    doc_idx: usize,
+    score: f32,
+}
+
 pub fn run_search_demo() -> Result<()> {
     let corpus = search_corpus();
     let queries = queries();
     let corpus_strings: Vec<String> = corpus.iter().map(|s| s.to_string()).collect();
 
     println!("\n=== retrieval quality demo ===");
-    println!("{} docs, {} queries; printing top-3 per query for each model.\n", corpus.len(), queries.len());
+    println!(
+        "{} docs (incl. 1 Swedish), {} queries (incl. 1 Swedish).",
+        corpus.len(),
+        queries.len()
+    );
 
-    // ---- model2vec ----
-    let m2v = StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None)?;
-    let m2v_corpus = m2v.encode(&corpus_strings);
-    let m2v_queries: Vec<Vec<f32>> = queries
-        .iter()
-        .map(|q| m2v.encode_single(q))
-        .collect();
+    let m2v_models: &[(&str, &str)] = &[
+        ("potion-base-8M",         "minishlab/potion-base-8M"),
+        ("potion-base-32M",        "minishlab/potion-base-32M"),
+        ("potion-retrieval-32M",   "minishlab/potion-retrieval-32M"),
+        ("potion-multi-128M",      "minishlab/potion-multilingual-128M"),
+    ];
 
-    // ---- fastembed ----
+    // model_label -> Vec<Top1 per query>
+    let mut all_top1: Vec<(String, Vec<Top1>)> = Vec::new();
+    // Same data, full top-3 for the detailed dump.
+    let mut detailed: Vec<(String, Vec<Vec<(usize, f32)>>)> = Vec::new();
+
+    for (label, repo) in m2v_models {
+        println!("[{label}] loading...");
+        let m = StaticModel::from_pretrained(repo, None, None, None)?;
+        let c_vecs = m.encode(&corpus_strings);
+        let q_vecs: Vec<Vec<f32>> = queries.iter().map(|q| m.encode_single(q)).collect();
+
+        let mut top1 = Vec::new();
+        let mut top3 = Vec::new();
+        for qv in &q_vecs {
+            let ranked = topk(qv, &c_vecs, 3);
+            top1.push(Top1 { doc_idx: ranked[0].0, score: ranked[0].1 });
+            top3.push(ranked);
+        }
+        all_top1.push((label.to_string(), top1));
+        detailed.push((label.to_string(), top3));
+    }
+
+    // fastembed
+    println!("[bge-small-en] loading...");
     let mut fe = TextEmbedding::try_new(
         InitOptions::new(EmbeddingModel::BGESmallENV15).with_show_download_progress(false),
     )?;
     let fe_corpus = fe.embed(corpus.clone(), None)?;
     let fe_queries = fe.embed(queries.clone(), None)?;
-
-    for (qi, q) in queries.iter().enumerate() {
-        println!("Q: \"{}\"", q);
-        println!("  [model2vec/potion-8M]");
-        for (rank, (doc_i, score)) in topk(&m2v_queries[qi], &m2v_corpus, 3).iter().enumerate() {
-            println!("    {}. ({:.3}) {}", rank + 1, score, snippet(corpus[*doc_i], 90));
+    {
+        let mut top1 = Vec::new();
+        let mut top3 = Vec::new();
+        for qv in &fe_queries {
+            let ranked = topk(qv, &fe_corpus, 3);
+            top1.push(Top1 { doc_idx: ranked[0].0, score: ranked[0].1 });
+            top3.push(ranked);
         }
-        println!("  [fastembed/bge-small]");
-        for (rank, (doc_i, score)) in topk(&fe_queries[qi], &fe_corpus, 3).iter().enumerate() {
-            println!("    {}. ({:.3}) {}", rank + 1, score, snippet(corpus[*doc_i], 90));
+        all_top1.push(("bge-small-en".into(), top1));
+        detailed.push(("bge-small-en".into(), top3));
+    }
+
+    // Compact comparison: top-1 doc index per (model, query). Easy to scan.
+    // Each query has a "right answer" — annotate so the user can spot misses at a glance.
+    let expected_idx: &[usize] = &[
+        0,  // production outage  -> Slack incidents
+        2,  // rust embedding code -> embeddings.rs
+        7,  // cloud spend         -> AWS Cost Explorer
+        8,  // indexer freezes     -> Linear GOLD-128
+        5,  // candle -> faster    -> GitHub PR #482
+        15, // Swedish: prestanda  -> Notion standup
+    ];
+
+    println!("\n=== top-1 per query (✓ = expected doc, ✗ = miss) ===");
+    print!("{:<24}", "model");
+    for qi in 0..queries.len() {
+        print!(" {:>9}", format!("Q{}", qi + 1));
+    }
+    println!();
+    println!("{}", "-".repeat(24 + queries.len() * 10));
+    for (label, top1) in &all_top1 {
+        print!("{:<24}", label);
+        for (qi, t1) in top1.iter().enumerate() {
+            let mark = if t1.doc_idx == expected_idx[qi] { "✓" } else { "✗" };
+            print!(" {:>4}{:<5}", mark, format!("({:.2})", t1.score));
         }
         println!();
+    }
+    println!("\nlegend (queries):");
+    for (qi, q) in queries.iter().enumerate() {
+        println!("  Q{}: {}", qi + 1, q);
+    }
+
+    // Detailed top-3 for each model (so the user can see *which wrong doc* gets ranked).
+    println!("\n=== detailed top-3 results ===");
+    for (label, top3_per_q) in &detailed {
+        println!("\n[{label}]");
+        for (qi, ranked) in top3_per_q.iter().enumerate() {
+            println!("  Q{}: \"{}\"", qi + 1, queries[qi]);
+            for (rank, (doc_i, score)) in ranked.iter().enumerate() {
+                let mark = if rank == 0 && *doc_i == expected_idx[qi] { "✓" }
+                    else if rank == 0 { "✗" } else { " " };
+                println!(
+                    "    {} {}. ({:.3}) {}",
+                    mark,
+                    rank + 1,
+                    score,
+                    snippet(corpus[*doc_i], 88)
+                );
+            }
+        }
     }
 
     Ok(())

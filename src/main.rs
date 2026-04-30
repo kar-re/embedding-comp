@@ -60,9 +60,9 @@ fn time_block<T>(f: impl FnOnce() -> T) -> (T, Duration, Duration) {
 
 // ---------- batched runs (one big call) ----------
 
-fn bench_model2vec_batched(label: &str, docs: &[String]) -> Result<RunStats> {
-    println!("[model2vec/batched] loading minishlab/potion-base-8M ...");
-    let model = StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None)?;
+fn bench_model2vec_batched(label: &str, repo: &str, docs: &[String]) -> Result<RunStats> {
+    println!("[model2vec/batched] loading {repo} ...");
+    let model = StaticModel::from_pretrained(repo, None, None, None)?;
     let _ = model.encode_single(&docs[0]);
 
     println!("[model2vec/batched] embedding {} docs in one call ...", docs.len());
@@ -108,9 +108,9 @@ fn bench_fastembed_batched(label: &str, docs: &[String]) -> Result<RunStats> {
 // and embeds one snapshot at a time. This is what blocks the capture loop, so it's
 // the metric that matters for "will this make my laptop fan spin up".
 
-fn bench_model2vec_single(label: &str, docs: &[String]) -> Result<RunStats> {
-    println!("[model2vec/single] loading minishlab/potion-base-8M ...");
-    let model = StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None)?;
+fn bench_model2vec_single(label: &str, repo: &str, docs: &[String]) -> Result<RunStats> {
+    println!("[model2vec/single] loading {repo} ...");
+    let model = StaticModel::from_pretrained(repo, None, None, None)?;
     let _ = model.encode_single(&docs[0]);
 
     println!("[model2vec/single] embedding {} docs one at a time ...", docs.len());
@@ -219,15 +219,23 @@ fn main() -> Result<()> {
 
     // The hot path in goldfish: one-at-a-time, behind a Mutex.
     // This is the headline metric.
-    let single = vec![
-        bench_model2vec_single("model2vec/potion-8M", &docs)?,
-        bench_fastembed_single("fastembed/bge-small-en", &docs)?,
+    let m2v_models: &[(&str, &str)] = &[
+        ("m2v/potion-base-8M",         "minishlab/potion-base-8M"),
+        ("m2v/potion-base-32M",        "minishlab/potion-base-32M"),
+        ("m2v/potion-retrieval-32M",   "minishlab/potion-retrieval-32M"),
+        ("m2v/potion-multi-128M",      "minishlab/potion-multilingual-128M"),
     ];
+    let mut single = Vec::new();
+    for (label, repo) in m2v_models {
+        single.push(bench_model2vec_single(label, repo, &docs)?);
+    }
+    single.push(bench_fastembed_single("fastembed/bge-small-en", &docs)?);
     print_table("single-item embed loop (matches goldfish's indexer)", &single);
 
-    // Batched: shows the absolute ceiling each library can hit if you ever do bulk reindex.
+    // Batched: only show 8M m2v + fastembed for ceiling reference; the others
+    // scale predictably with vocab size.
     let batched = vec![
-        bench_model2vec_batched("model2vec/potion-8M", &docs)?,
+        bench_model2vec_batched("m2v/potion-base-8M", "minishlab/potion-base-8M", &docs)?,
         bench_fastembed_batched("fastembed/bge-small-en", &docs)?,
     ];
     print_table("batched embed (one big call -- bulk reindex scenario)", &batched);
